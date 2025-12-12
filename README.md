@@ -4,6 +4,25 @@ CloudFormation template that deploys a VPC with an EC2 instance running OpenVPN.
 
 Uses [angristan/openvpn-install](https://github.com/angristan/openvpn-install) for headless OpenVPN setup.
 
+## Resources Created
+
+| Resource | Type | Description |
+|----------|------|-------------|
+| VPC | `AWS::EC2::VPC` | Virtual Private Cloud with DNS support |
+| Internet Gateway | `AWS::EC2::InternetGateway` | Enables internet access for the VPC |
+| Public Subnet | `AWS::EC2::Subnet` | Subnet with auto-assign public IP |
+| Route Table | `AWS::EC2::RouteTable` | Routes traffic to the Internet Gateway |
+| Network ACL | `AWS::EC2::NetworkAcl` | Allows SSH (22), OpenVPN (1194/UDP), and ephemeral ports |
+| Security Group | `AWS::EC2::SecurityGroup` | Controls inbound/outbound traffic for EC2 |
+| S3 Bucket | `AWS::S3::Bucket` | Stores the generated `.ovpn` client config |
+| S3 Bucket Policy | `AWS::S3::BucketPolicy` | Allows EC2 instance to upload files |
+| SNS Topic | `AWS::SNS::Topic` | Notification topic for setup completion |
+| SNS Subscription | `AWS::SNS::Subscription` | Email subscription for notifications |
+| IAM Role | `AWS::IAM::Role` | Grants EC2 access to S3 and SNS |
+| Instance Profile | `AWS::IAM::InstanceProfile` | Attaches IAM role to EC2 |
+| EC2 Instance | `AWS::EC2::Instance` | Ubuntu 24.04 server running OpenVPN |
+| Elastic IP | `AWS::EC2::EIP` | Static public IP for the VPN server |
+
 ## Prerequisites
 
 - AWS CLI configured
