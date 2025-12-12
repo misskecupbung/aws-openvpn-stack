@@ -81,8 +81,13 @@ Import `client1.ovpn` into your OpenVPN client.
 ## Clean Up
 
 ```bash
+# Empty the bucket first (CloudFormation can't delete non-empty buckets)
+aws s3 rm s3://$BUCKET_NAME --recursive --region $AWS_REGION
+
+# Delete the stack
 aws cloudformation delete-stack --stack-name $STACK_NAME --region $AWS_REGION
-aws s3 rb s3://$BUCKET_NAME --force
+
+# Clean up key pair
 aws ec2 delete-key-pair --key-name $KEY_PAIR --region $AWS_REGION
 rm -f ${KEY_PAIR}.pem
 ```

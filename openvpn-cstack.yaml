@@ -191,10 +191,9 @@ Resources:
 
   S3Bucket:
     Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
     Properties:
       BucketName: !Ref BucketName
-      VersioningConfiguration:
-        Status: Enabled
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
