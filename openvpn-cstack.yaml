@@ -40,23 +40,12 @@ Parameters:
     Type: String
     Description: S3 bucket name (must be globally unique).
   LatestAmiId:
-    Type: AWS::SSM::Parameter::Value<String>
-    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    Description: SSM parameter for latest Amazon Linux AMI. Change arch if needed.
-  Architecture:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: SSM parameter for latest Ubuntu 24.04 LTS AMI.
+  NotificationEmail:
     Type: String
-    Default: arm64
-    AllowedValues:
-      - x86_64
-      - arm64
-    Description: CPU architecture to match AMI.
-
-Mappings:
-  ArchToAmiParam:
-    x86_64:
-      AmiParam: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
-    arm64:
-      AmiParam: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: Email address to receive notification when OVPN file is ready.
 
 Resources:
   VPC:
@@ -231,6 +220,18 @@ Resources:
               - s3:PutObjectAcl
             Resource: !Sub 'arn:aws:s3:::${S3Bucket}/*'
 
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-openvpn-notifications'
+
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !Ref NotificationEmail
+
   InstanceRole:
     Type: AWS::IAM::Role
     Properties:
@@ -245,15 +246,24 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
       Policies:
-        - PolicyName: S3UploadOpenVpnProfile
+        - PolicyName: S3Access
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
+                  - s3:GetObject
                   - s3:PutObject
                   - s3:PutObjectAcl
                 Resource: !Sub 'arn:aws:s3:::${S3Bucket}/*'
+        - PolicyName: SNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
       Tags:
         - Key: Name
           Value: !Sub '${EnvironmentName}-instance-role'
@@ -267,53 +277,6 @@ Resources:
 
   OpenVpnInstance:
     Type: AWS::EC2::Instance
-    Metadata:
-      AWS::CloudFormation::Init:
-        config:
-          packages:
-            yum:
-              tar: []
-              wget: []
-              unzip: []
-          files:
-            /tmp/openvpn_setup.sh:
-              content: !Sub |
-                #!/bin/bash
-                set -eux
-                LOG=/var/log/openvpn-bootstrap.log
-                echo "Starting OpenVPN install" > $LOG
-                # Install dependencies
-                yum install -y curl awscli unzip tar >/dev/null 2>&1 || dnf install -y curl awscli unzip tar
-                cd /root
-                echo "Downloading OpenVPN install script" >> $LOG
-                curl -fsSLO https://raw.githubusercontent.com/angristan/openvpn-install/master/openvpn-install.sh
-                chmod +x openvpn-install.sh
-                # Headless install with default answers. Adjust env vars if you need custom DNS or protocol.
-                export AUTO_INSTALL=y
-                # Non-interactive defaults can be overridden via environment variables documented in the project README.
-                # Run script; it will create /etc/openvpn/server and a first client when prompted; we auto add one.
-                ./openvpn-install.sh >> $LOG 2>&1 || { echo "OpenVPN install failed" >> $LOG; exit 1; }
-                # Create initial client config (script normally asks interactively). We emulate add-client.
-                CLIENT_NAME=client1
-                echo -e "${CLIENT_NAME}\n" | sed 's/.*/&/' > /tmp/clientname.txt
-                # Use expect-like here by feeding client name to the add-client function.
-                printf "%s\n" "$CLIENT_NAME" | ./openvpn-install.sh --addclient >> $LOG 2>&1 || true
-                # Find generated .ovpn file (script places in current dir or /root). Pattern: ${CLIENT_NAME}.ovpn
-                OVPN_FILE=$(find /root -maxdepth 2 -name "${CLIENT_NAME}.ovpn" | head -1)
-                if [ -z "$OVPN_FILE" ]; then
-                  echo "Could not locate client ovpn file" >> $LOG
-                  exit 2
-                fi
-                # Upload to S3
-                aws s3 cp "$OVPN_FILE" s3://${BucketName}/${CLIENT_NAME}.ovpn >> $LOG 2>&1 || {
-                  echo "S3 upload failed" >> $LOG; exit 3; }
-                echo "Completed" >> $LOG
-              mode: '000755'
-              owner: root
-              group: root
-          commands:
-            01_run_setup:
-              command: /tmp/openvpn_setup.sh
     Properties:
       InstanceType: !Ref InstanceType
       IamInstanceProfile: !Ref InstanceProfile
@@ -328,8 +291,34 @@ Resources:
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
-          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource OpenVpnInstance --region ${AWS::Region}
-          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource OpenVpnInstance --region ${AWS::Region}
+          set -ex
+          exec > >(tee /var/log/openvpn-bootstrap.log) 2>&1
+
+          # Wait for network and metadata service
+          sleep 10
+
+          # Update and upgrade
+          apt-get update && \
+          apt-get upgrade -y && \
+          apt-get install -y curl unzip
+
+          # Install AWS CLI v2
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
+          unzip -q /tmp/awscliv2.zip -d /tmp
+          /tmp/aws/install
+          rm -rf /tmp/awscliv2.zip /tmp/aws
+
+          # Download and run OpenVPN install script
+          curl -fsSLO https://raw.githubusercontent.com/angristan/openvpn-install/master/openvpn-install.sh
+          chmod +x openvpn-install.sh
+          AUTO_INSTALL=y ./openvpn-install.sh
+
+          # Upload .ovpn file to S3
+          OVPN_FILE=$(find /home/ssm-user -name "*.ovpn" -type f 2>/dev/null | head -1)
+          if [ -n "$OVPN_FILE" ]; then
+            aws s3 cp "$OVPN_FILE" s3://${BucketName}/client1.ovpn
+            aws sns publish --topic-arn ${NotificationTopic} --region ${AWS::Region} --subject "OpenVPN Ready" --message "Download: aws s3 cp s3://${BucketName}/client1.ovpn ."
+          fi
 
   OpenVpnInstanceEip:
     Type: AWS::EC2::EIP
